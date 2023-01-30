@@ -1,213 +1,388 @@
-from extra_data import open_run, by_id, DataCollection
-from extra_data.validation import RunValidator
-#from lib import boxcar
-import numpy as np
-import importlib
-import logging
-import pickle
-import xarray as xr
-import dask.array as da
-from dask.distributed import Client, progress
-from dask_jobqueue import SLURMCluster
-#Lpd libraries
-from extra_geom import LPD_1MGeometry
-from extra_data.components import LPD1M
-from pyFAI.gui import jupyter
-from pyFAI.distortion import Distortion
+import requests
+from datetime import datetime
+import os
+import builtins
+import re
+import urllib
+class Logbook():
+    subject = "Robot post"
+    _type = "Commissioning"
+    category = "Robot"
+    text = "Text"
+    msgId = 1960
+    _url ="https://in.xfel.eu/elog/FXE+Commissioning+%26+Operation/"
 
-
-quadPos = [[12.0, 292.0], [-5, 1.5], [261, -15], [278.5, 275]]  
-lpd_path = "/gpfs/exfel/data/scratch/ardanaf/lpd"
-
-# In case we need to shift Quadrants
-qp=np.array(quadPos)
-qp-=np.array([0,0])
-# I load the modified version (orignal one has Q2M2 all tiles set to -100,-100 
-geom=LPD_1MGeometry.from_h5_file_and_quad_positions("%s/lpd_mar_18_m2.h5" % lpd_path, qp)
-pFAI_lpd=geom.to_pyfai_detector()
-pFAI_lpd.aliases = ["LPD1M"]
-# Modules are stack in 1-dim 256*16
-pFAI_lpd.shape = (4096, 256)
-pFAI_lpd.mask = np.zeros((4096, 256))
-pFAI_lpd.set_pixel_corners(geom.to_distortion_array())
-pFAI_lpd.distortion_correction = Distortion(pFAI_lpd,resize=True)
-
-
-# Redefination of LPD1M class 
-# Basically always produce a 16 module output.
-# You need to 
-class LPD1Mm(LPD1M):
-    """ Redefination of LPD1M class. 
-        always gives a 16 module output in a row (16*256, 256)
-        you need to provide bad modules so they will be  set to all 0
-    """
+    def __init__(self, user="fxe_robot", passw="iamrobot", kwargs={}):
+        self._user = user
+        self._password = passw
+        self.session=requests.Session()
+        self.session.get(self._url, params={"uname":self._user, "upassword": self._password})
     
-    def __init__(self, data: DataCollection, detector_name=None, b_modules=None,
-                 *, min_modules=1, parallel_gain=False):
-        modules = set(range(16))
-        self._bmodules=[]
-        self._gmodules=set(range(16))
-        for i in b_modules:
-            if i in modules:
-                self._gmodules.remove(i)
-                self._bmodules.append(i)
-        super().__init__(data, detector_name, modules, min_modules=min_modules)
-    #Reimplemnet at my tase
-    def get_dask_array(self, key, subtrain_index='pulseId', fill_value=None,
-                       astype=None):
-        """Get a labelled Dask array of detector data
-        Dask does lazy, parallelised computing, and can work with large data
-        volumes. This method doesn't immediately load the data: that only
-        happens once you trigger a computation.
-        Parameters
-        ----------
-        key: str
-          The data to get, e.g. 'image.data' for pixel values.
-        subtrain_index: str, optional
-          Specify 'pulseId' (default) or 'cellId' to label the frames recorded
-          within each train. Pulse ID should allow this data to be matched with
-          other devices, but depends on how the detector was manually configured
-          when the data was taken. Cell ID refers to the memory cell used for
-          that frame in the detector hardware.
-        fill_value: int or float, optional
-          Value to use for missing values. If None (default) the fill value is 0
-          for integers and np.nan for floats.
-        astype: Type, optional
-          data type of the output array. If None (default) the dtype matches the
-          input array dtype
+    def post(self):
+        self.msgId = self._post(self.text, attributes={"Type": self.type, "Subject": self.subject, "Category": self.category})
+
+    def edit(self):
+        msg, atr, attac = self._read(self.msgId)
+        self._post(msg + self.text, msg_id=self.msgId)
+
+    def editTable(self):
+        msg, atr, attac = self._read(self.msgId)
+        tend = msg.index("\t</tbody>")
+        txt=msg[:tend] + self.text +"\n" + msg[tend:]
+        print(txt)
+        self._post(txt,
+                   msg_id=self.msgId)
+
+    def read(self):
+        self._read(self.msgId)
+ 
+    def _make_user_and_pswd_cookie(self):
         """
-        if subtrain_index not in {'pulseId', 'cellId'}:
-            raise ValueError("subtrain_index must be 'pulseId' or 'cellId'")
-        arrays = []
-        modnos = []
-        for modno, source in sorted(self.modno_to_source.items()):
-            modnos.append(modno)
-            if modno in self._bmodules:
-                continue
-            mod_arr = self.data.get_dask_array(source, key, labelled=True)
-            # At present, all the per-pulse data is stored in the 'image' key.
-            # If that changes, this check will need to change as well.
-            if key.startswith('image.'):
-                # Add pulse IDs to create multi-level index
-                inner_ix = self.data.get_array(source, 'image.' + subtrain_index)
-                # Raw files have a spurious extra dimension
-                if inner_ix.ndim >= 2 and inner_ix.shape[1] == 1:
-                    inner_ix = inner_ix[:, 0]
+        prepares user name and password cookie. It is sent in header when posting a message.
+        :return: user name and password value for the Cookie header
+        """
+        cookie = ''
+        if self._user:
+            cookie += 'uname=' + self._user + ';'
+        if self._password:
+            cookie += 'upassword=' + self._password + ';'
 
-                mod_arr = mod_arr.rename({'trainId': 'train_pulse'})
+        return cookie
 
-                mod_arr.coords['train_pulse'] = self._make_image_index(
-                    mod_arr.coords['train_pulse'].values, inner_ix.values,
-                    inner_name=subtrain_index,
-                ).set_names('trainId', level=0)
-                # This uses 'trainId' where a concrete array from the same class
-                # uses 'train'. I didn't notice that inconsistency when I
-                # introduced it, and now code may be relying on each name.
-            if mod_arr.shape[1] == 1:
-                arrays.append(mod_arr[:,0])
+    def _add_base_msg_attributes(self, data):
+        """
+        Adds base message attributes which are used by all messages.
+        :param data: dict of current attributes
+        :return: content string
+        """
+        data['cmd'] = 'Submit'
+        #data['exp'] = self.logbook
+        data['suppress']= 1
+
+    def _read(self, msg_id):
+        """
+        Reads message from the logbook server and returns tuple of (message, attributes, attachments) where:
+        message: string with message body
+        attributes: dictionary of all attributes returned by the logbook
+        attachments: list of urls to attachments on the logbook server
+        :param msg_id: ID of the message to be read
+        :return: message, attributes, attachments
+        """
+        #request_headers = dict()
+        #if self._user or self._password:
+        #    request_headers['Cookie'] = self._make_user_and_pswd_cookie()
+
+        try:
+            self._check_if_message_on_server(msg_id)  # raises exceptions if no message or no response from server
+            response = self.session.get(self._url + str(msg_id) + '?cmd=download',
+                                    allow_redirects=False, verify=False)
+
+            # Validate response. If problems Exception will be thrown.
+            resp_message, resp_headers, resp_msg_id = _validate_response(response)
+
+        except RequestException as e:
+            # If here: message is on server but cannot be downloaded (should never happen)
+            raise LogbookServerProblem('Cannot access logbook server to read the message with ID: ' + str(msg_id) +
+                                       'because of:\n' + '{0}'.format(e))
+
+        # Parse message to separate message body, attributes and attachments
+        attributes = dict()
+        attachments = list()
+
+        returned_msg = resp_message.decode('utf-8', 'ignore').splitlines()
+        delimiter_idx = returned_msg.index('========================================')
+
+
+        message = '\n'.join(returned_msg[delimiter_idx + 1:])
+        for line in returned_msg[0:delimiter_idx]:
+            line = line.split(': ')
+            data = ''.join(line[1:])
+            if line[0] == 'Attachment':
+                if not data:
+                    # Treat the empty string as special case,
+                    # otherwise the split below returns [""] and attachments is [self._url]
+                    attachments = []
+                else:
+                    attachments = data.split(',')
+                    # Here are only attachment names, make a full url out of it, so they could be
+                    # recognisable by others, and downloaded if needed
+                    attachments = [self._url + '{0}'.format(i) for i in attachments]
             else:
-                arrays.append(mod_arr)
-        shape=arrays[0].copy()
-        for i in self._bmodules:    
-            arrays.insert(i, 0*shape)
-        dt = self._concat(arrays, modnos, fill_value, astype)
-        dst = da.hstack(list(dt[i] for i in range(16)))
+                attributes[line[0]] = data
 
-        return xr.DataArray(dst, dims=['train_pulse', 'x', 'y'], 
-                            coords={'train_pulse': dt.train_pulse})
+        return message, attributes, attachments
+      
+    def _post(self, message, msg_id=None, reply=False, 
+              attributes=None, attachments=None, 
+              encoding='HTML',  **kwargs):
 
-#importlib.reload(boxcar)
-log = logging.getLogger(__name__)
+        attributes = attributes or {}
+        attributes = {**attributes, **kwargs}  # kwargs as attributes with higher priority
 
-dataDevice={"GOTTHARD1":["FXE_OGT1_SA/DAQ/DETECTOR:daqOutput", "data.adc"],
-            "GOTTHARD2":["FXE_OGT3_SA/DET/RECEIVER:daqOutput", "data.adc"],
-            "JFG1M2":["FXE_XAD_JF1M/DET/JNGFR02:daqOutput", "data.adc"],
-            "JFG1M1":["FXE_XAD_JF1M/DET/JNGFR01:daqOutput", "data.adc"],
-            "JFG500K":["FXE_XAD_JF500K/DET/JNGFR03:daqOutput", "data.adc"],
-            "PINK":["FXE_RR_DAQ/ADC/1:network", "digitizers.channel_2_B.raw.samples"],
-            "APD":["FXE_RR_DAQ/ADC/1:network", "digitizers.channel_2_A.raw.samples"],
-            "I01":["FXE_RR_DAQ/ADC/1:network", "digitizers.channel_1_A.raw.samples"],
-            "I02":["FXE_RR_DAQ/ADC/1:network", "digitizers.channel_1_B.raw.samples"],
-            "I03":["FXE_RR_DAQ/ADC/1:network", "digitizers.channel_1_C.raw.samples"],
-            "I04":["FXE_RR_DAQ/ADC/1:network", "digitizers.channel_1_D.raw.samples"],
-           }
+        attachments = attachments or []
 
+        if encoding is not None:
+            if encoding not in ['plain', 'HTML', 'ELCode']:
+                raise LogbookMessageRejected('Invalid message encoding. Valid options: plain, HTML, ELCode.')
+            attributes['Encoding'] = encoding
 
-knobDevice={"PPODL":["FXE_AUXT_LIC/DOOCS/PPODL", "actualPosition.value"],
-            "PPODL_T":["FXE_AUXT_LIC/DOOCS/PPODL", "targetPosition.value"],
-            "MONO":["FXE_XTD9_MONO/MDL/ACCM_PITCH", "actualPosition.value"],
-            "BAM":["FXE_AUXT_LIC/DOOCS/BAM_1932S:output", "data.lowChargeArrivalTime"]}
+        attributes_to_edit = dict()
+        if msg_id:
+            # Message exists, we can continue
+            if reply:
+                # Verify that there is a message on the server, otherwise do not reply to it!
+                self._check_if_message_on_server(msg_id)  # raises exception in case of none existing message
 
-otherDevice={"pattern1":["SA1_RR_UTC/MDL/BUNCH_DECODER", "sase1.pulseIds.value"]}
+                attributes['reply_to'] = str(msg_id)
 
-def getWorker(scale=1, partition="exfel", reservation=None):
-    # Resources per SLURM job (per node, the way SLURM is configured on Maxwell)
-    # processes=16 runs 16 Dask workers in a job, so each worker has 1 core & 32 GB RAM.
-    # For EuXFEL staff
-    cluster = SLURMCluster(
-                           queue=partition,
-                           reservation=reservation,
-                           local_directory='/scratch', 
-                            processes=16, cores=16, memory='512GB')
-    #cluster.scale(scale)
-    return cluster
+            else:  # Edit existing
+                attributes['edit_id'] = str(msg_id)
+                attributes['skiplock'] = '1'
 
-def getDaskWorkers(cluster):
-    client = Client(cluster)
-    return client
+                # Handle existing attachments
+                msg_to_edit, attributes_to_edit, attach_to_edit = self._read(msg_id)
 
+                i = 0
+                for attachment in attach_to_edit:
+                    if attachment:
+                        # Existing attachments must be passed as regular arguments attachment<i> with value= file name
+                        # Read message returnes full urls to existing attachments:
+                        # <hostname>:[<port>][/<subdir]/<logbook>/<msg_id>/<file_name>
+                        attributes['attachment' + str(i)] = os.path.basename(attachment)
+                        i += 1
 
-class AnalyseRun(DataCollection):
-    def __init__(self, proposal, run, data_type='all'):
-        mCol = open_run(proposal, run, data=data_type)
-        super().__init__(mCol.files)
-        self.dSet = xr.Dataset()
+                for attribute, data in attributes.items():
+                    new_data = attributes.get(attribute)
+                    if new_data is not None:
+                        attributes_to_edit[attribute] = new_data
+        else:
+            # As we create a new message, specify creation time if not already specified in attributes
+            if 'When' not in attributes:
+                attributes['When'] = int(datetime.now().timestamp())
+
+        if not attributes_to_edit:
+            attributes_to_edit = attributes
+        # Remove any attributes that should not be sent
+        _remove_reserved_attributes(attributes_to_edit)
+
+        if attachments:
+            files_to_attach, objects_to_close = self._prepare_attachments(attachments)
+        else:
+            objects_to_close = list()
+            files_to_attach = list()
+
+        # Make requests module think that Text is a "file". This is the only way to force requests to send data as
+        # multipart/form-data even if there are no attachments. Elog understands only multipart/form-data
+        files_to_attach.append(('Text', ('', message)))
+
+        # Base attributes are common to all messages
+        self._add_base_msg_attributes(attributes_to_edit)
         
-    def addData(self, name, channel, alias=None):
-        if alias is None:
-            alias=name
-        if not(name in self.all_sources):
-            print("%s is not present" % name)
-            return
-        if not(channel in self.keys_for_source(name)):
-            print("Property %s not present for %s" % (channel, name))
-            return
-        self.dSet=self.dSet.merge({alias:self.get_dask_array(name, channel, labelled=True)})
-        
-    def addDataSet(self, data, alias):
-        self.dSet = self.dSet.merge({alias:data})
-        
-    def addKnob(self, name, alias=None):
-        if alias is None:
-            alias = name
-        if not(name in self.control_sources):
-            print("%s is not present" % name)
-            return
-        nSet=xr.Dataset(data_vars={
-            "%s_Trg" % alias:self.get_dask_array(name, 'targetPosition.value', labelled=True),
-           "%s_Pos" % alias:self.get_dask_array(name, 'actualPosition.value', labelled=True)})
-        self.dSet=self.dSet.merge(nSet)
-        
-    def splitOddEvenTrains(self):
-        self.onSet = self.dSet.where(self.dSet.trainId % 2 ==1, drop=True)
-        off = self.dSet.where(self.dSet.trainId %2, drop=True)
-        offset =  off.trainId[0]-self.onSet.trainId[0]
-        off = off.assign_coords(trainId=off.trainId-offset)
-        self.offSet = off
+        # Keys in attributes cannot have certain characters like whitespaces or dashes for the http request
+        attributes_to_edit["Text"]= message
+        attributes_to_edit = _replace_special_characters_in_attribute_keys(attributes_to_edit)
+
+        try:
+            response = self.session.post(self._url, data=attributes_to_edit, files=files_to_attach, allow_redirects=False, verify=False)
+            #response = self.session.get(self._url, params=attributes_to_edit)
+            # Validate response. Any problems will raise an Exception.
+            resp_message, resp_headers, resp_msg_id = _validate_response(response)
+            print(resp_message)
+
+            # Close file like objects that were opened by the elog (if  path
+            for file_like_object in objects_to_close:
+                if hasattr(file_like_object, 'close'):
+                    file_like_object.close()
+
+        except requests.RequestException as e:
+            # Check if message on server.
+            self._check_if_message_on_server(msg_id)  # raises exceptions if no message or no response from server
+
+            # If here: message is on server but cannot be downloaded (should never happen)
+            raise LogbookServerProblem('Cannot access logbook server to post a message, ' + 'because of:\n' +
+                                       '{0}'.format(e))
+
+        # Any error before here should raise an exception, but check again for nay case.
+        if not resp_msg_id or resp_msg_id < 1:
+            raise LogbookInvalidMessageID('Invalid message ID: ' + str(resp_msg_id) + ' returned')
+        return resp_msg_id
     
-    def splitOddEvenPulses(self, dim='pulseId'):
-        self.onSet = self.dSet.where(self.dSet['%s' % dim] % 2 ==1, drop=True)
-        off = self.dSet.where(self.dSet['%s' % dim] %2, drop=True)
-        # off = off.assign_coords(dim:off['%s' % dim]-1)
-        self.offSet = off
-    
-    def averageKnob(self, knob, tol=None):
-        if tol is None:
-            tol = np.diff(self.dSet["%s_pos" % knob]).mean()
-        self.scnPts = np.unique(self.dSet["%s_Trg" % knob])
-        self.subs={}
-        for i in self.scnPts:
-            self.subs['%s'%i]=self.dSet.where(self.dSet["%s_Trg" % knob]==i, drop=True)
-        
-        
+    def _check_if_message_on_server(self, msg_id):
+        """Try to load page for specific message. If there is a htm tag like <td class="errormsg"> then there is no
+        such message.
+        :param msg_id: ID of message to be checked
+        :return:
+        """
+
+        #request_headers = dict()
+        #if self._user or self._password:
+        #    request_headers['Cookie'] = self._make_user_and_pswd_cookie()
+        try:
+            response = self.session.get(self._url + str(msg_id), allow_redirects=False,
+                                    verify=False)
+
+            # If there is no message code 200 will be returned (OK) and _validate_response will not recognise it
+            # but there will be some error in the html code.
+            resp_message, resp_headers, resp_msg_id = _validate_response(response)
+            # If there is no message, code 200 will be returned (OK) but there will be some error indication in
+            # the html code.
+            if re.findall('<td.*?class="errormsg".*?>.*?</td>',
+                          resp_message.decode('utf-8', 'ignore'),
+                          flags=re.DOTALL):
+                raise LogbookInvalidMessageID('Message with ID: ' + str(msg_id) + ' does not exist on logbook.')
+
+        except RequestException as e:
+            raise LogbookServerProblem('No response from the logbook server.\nDetails: ' + '{0}'.format(e))
+            
+    def _prepare_attachments(self, files):
+        """
+        Parses attachments to content objects. Attachments can be:
+            - file like objects: must have method read() which returns bytes. If it has attribute .name it will be used
+              for attachment name, otherwise generic attribute<i> name will be used.
+            - path to the file on disk
+        Note that if attachment is is an url pointing to the existing Logbook server it will be ignored and no
+        exceptions will be raised. This can happen if attachments returned with read_method are resend.
+        :param files: list of file like objects or paths
+        :return: content string
+        """
+        prepared = list()
+        i = 0
+        objects_to_close = list()  # objects that are created (opened) by elog must be later closed
+        for file_obj in files:
+            if hasattr(file_obj, 'read'):
+                i += 1
+                attribute_name = 'attfile' + str(i)
+
+                filename = attribute_name  # If file like object has no name specified use this one
+                candidate_filename = os.path.basename(file_obj.name)
+
+                if filename:  # use only if not empty string
+                    filename = candidate_filename
+
+            elif isinstance(file_obj, str):
+                # Check if it is:
+                #           - a path to the file --> open file and append
+                #           - an url pointing to the existing Logbook server --> ignore
+
+                filename = ""
+                attribute_name = ""
+
+                if os.path.isfile(file_obj):
+                    i += 1
+                    attribute_name = 'attfile' + str(i)
+
+                    file_obj = builtins.open(file_obj, 'rb')
+                    filename = os.path.basename(file_obj.name)
+
+                    objects_to_close.append(file_obj)
+
+                elif not file_obj.startswith(self._url):
+                    raise LogbookInvalidAttachmentType('Invalid type of attachment: \"' + file_obj + '\".')
+            else:
+                raise LogbookInvalidAttachmentType('Invalid type of attachment[' + str(i) + '].')
+
+            prepared.append((attribute_name, (filename, file_obj)))
+
+        return prepared, objects_to_close
+
+
+
+
+def _remove_reserved_attributes(attributes):
+    """
+    Removes elog reserved attributes (from the attributes dict) that can not be sent.
+
+    :param attributes: dictionary of attributes to be cleaned.
+    :return:
+    """
+
+    if attributes:
+        attributes.get('$@MID@$', None)
+        attributes.pop('Date', None)
+        attributes.pop('Attachment', None)
+        attributes.pop('Text', None)  # Remove this one because it will be send attachment like
+
+def _replace_special_characters_in_attribute_keys(attributes):
+    """
+    Replaces special characters in elog attribute keys by underscore, otherwise attribute values will be erased in
+    the http request. This is using the same replacement elog itself is using to handle these cases
+    :param attributes: dictionary of attributes to be cleaned.
+    :return: attributes with replaced keys
+    """
+    return {re.sub('[^0-9a-zA-Z]', '_', key): value for key, value in attributes.items()}
+
+def _validate_response(response):
+    """ Validate response of the request."""
+
+    msg_id = None
+
+    if response.status_code not in [200, 302]:
+        # 200 --> OK; 302 --> Found
+        # Html page is returned with error description (handling errors same way as on original client. Looks
+        # like there is no other way.
+
+        err = re.findall('<td.*?class="errormsg".*?>.*?</td>',
+                         response.content.decode('utf-8', 'ignore'),
+                         flags=re.DOTALL)
+
+        if len(err) > 0:
+            # Remove html tags
+            # If part of the message has: Please go  back... remove this part since it is an instruction for
+            # the user when using browser.
+            err = re.sub('(?:<.*?>)', '', err[0])
+            if err:
+                raise LogbookMessageRejected('Rejected because of: ' + err)
+            else:
+                raise LogbookMessageRejected('Rejected because of unknown error.')
+
+        # Other unknown errors
+        raise LogbookMessageRejected('Rejected because of unknown error.')
+    else:
+        location = response.headers.get('Location')
+        if location is not None:
+            if 'has moved' in location:
+                raise LogbookServerProblem('Logbook server has moved to another location.')
+            elif 'fail' in location:
+                raise LogbookAuthenticationError('Invalid username or password.')
+            else:
+                # returned locations is something like: '<host>/<sub_dir>/<logbook>/<msg_id><query>
+                # with urllib.parse.urlparse returns attribute path=<sub_dir>/<logbook>/<msg_id>
+                print(urllib.parse.urlsplit(location).path.split('/')[-1])
+                msg_id = int(urllib.parse.urlsplit(location).path.split('/')[-1])
+
+        if b'form name=form1' in response.content or b'type=password' in response.content:
+            # Not to smart to check this way, but no other indication of this kind of error.
+            # C client does it the same way
+            raise LogbookAuthenticationError('Invalid username or password.')
+
+    return response.content, response.headers, msg_id
+
+class LogbookError(Exception):
+    """ Parent logbook exception."""
+    pass
+
+
+class LogbookAuthenticationError(LogbookError):
+    """ Raise when problem with username and password."""
+    pass
+
+
+class LogbookServerProblem(LogbookError):
+    """ Raise when problem accessing logbook server."""
+    pass
+
+
+class LogbookMessageRejected(LogbookError):
+    """ Raised when manipulating/creating message was rejected by the server or there was problem composing message."""
+    pass
+
+
+class LogbookInvalidMessageID(LogbookMessageRejected):
+    """ Raised when there is no message with specified ID on the server."""
+    pass
+
+
+class LogbookInvalidAttachmentType(LogbookMessageRejected):
+    """ Raised when passed attachment has invalid type."""
+    pass
         
